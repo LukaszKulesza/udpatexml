@@ -1,0 +1,176 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Finalna wersja – aktualizacja stanów i cen z feedu https://vpn.gwalento.ovh/b2b/stany.xml
+ * SKU = atrybut SKU
+ * Stan = atrybut STAN (zawsze nadpisywany, nawet 0)
+ * Cena = BRUTTO * mnożnik (tylko gdy STAN > 0)
+ */
+
+const PRODUCTS_XML_IN   = 'C:\\Users\\gosc\\baselinker-sync\\Produkty_xml_dawika.xml';
+const OUT_PART1         = 'C:\\Users\\gosc\\baselinker-sync\\Produkty_xml_dawika_UPDATED_part1.xml';
+const OUT_PART2         = 'C:\\Users\\gosc\\baselinker-sync\\Produkty_xml_dawika_UPDATED_part2.xml';
+const MAX_PART_BYTES    = 29 * 1024 * 1024;
+
+const STANY_SOURCE      = 'https://vpn.gwalento.ovh/b2b/stany.xml';
+const LOG_DIR           = 'C:\\Users\\gosc\\baselinker-sync\\logs';
+
+@mkdir(LOG_DIR, 0777, true);
+
+function logLine(string $file, $line): void {
+    $str = is_scalar($line) ? (string)$line : print_r($line, true);
+    file_put_contents($file, $str . PHP_EOL, FILE_APPEND);
+}
+
+function mult(float $gross): float {
+    if ($gross < 10.0)  return 1.5;
+    if ($gross < 100.0) return 1.4;
+    if ($gross < 1000.0) return 1.35;
+    return 1.2;
+}
+
+function fetchStanyRaw(): string {
+    echo "Pobieram feed stanów...\n";
+    $cmd = 'curl --insecure --ssl-no-revoke -L --fail --silent --show-error --output temp_stany.xml ' . escapeshellarg(STANY_SOURCE);
+    shell_exec($cmd);
+    $raw = file_get_contents('temp_stany.xml');
+    @unlink('temp_stany.xml');
+    if ($raw === false || trim($raw) === '') {
+        throw new RuntimeException("Nie udało się pobrać feedu stanów");
+    }
+    echo "Pobrano " . strlen($raw) . " bajtów\n";
+    return $raw;
+}
+
+function parseStanyMap(string $rawXml): array {
+    $map = [];
+    $xr = new XMLReader();
+    if (!$xr->XML($rawXml)) throw new RuntimeException("Błąd parsowania feedu");
+
+    while ($xr->read()) {
+        if ($xr->nodeType !== XMLReader::ELEMENT || $xr->name !== 'rekord') continue;
+
+        $sku   = trim($xr->getAttribute('SKU') ?: '');
+        $stan  = (int)round((float)str_replace(',', '.', $xr->getAttribute('STAN') ?: '0'));
+        $brutto = (float)str_replace(',', '.', $xr->getAttribute('BRUTTO') ?: '0');
+
+        if ($sku !== '') {
+            $map[$sku] = ['qty' => $stan, 'gross' => $brutto];
+        }
+    }
+    $xr->close();
+    return $map;
+}
+
+// ====================== GŁÓWNA FUNKCJA ======================
+function updateProductsXmlSplit2(array $stany): void {
+    if (!is_file(PRODUCTS_XML_IN)) throw new RuntimeException("Brak pliku dawika");
+
+    $logUpdated = LOG_DIR . '\\updated.log';
+    $logSkipped = LOG_DIR . '\\skipped_zero.log';
+    $logNotFound = LOG_DIR . '\\notfound.log';
+
+    @unlink($logUpdated); @unlink($logSkipped); @unlink($logNotFound);
+
+    $r = new XMLReader();
+    if (!$r->open(PRODUCTS_XML_IN)) throw new RuntimeException("Nie mogę otworzyć dawika.xml");
+
+    $part = 1;
+    $w = writerOpen(OUT_PART1);
+    $bytes = 200;
+
+    while ($r->read() && !($r->nodeType === XMLReader::ELEMENT && $r->name === 'products'));
+
+    $total = $updated = $skipped = $notFound = 0;
+    $start = microtime(true);
+
+    while ($r->read()) {
+        if ($r->nodeType === XMLReader::END_ELEMENT && $r->name === 'products') break;
+        if ($r->nodeType !== XMLReader::ELEMENT || $r->name !== 'product') continue;
+
+        $total++;
+        $outer = $r->readOuterXML();
+        $sx = @simplexml_load_string($outer);
+        if (!$sx) {
+            $raw = preg_replace('/^<\?xml[^>]*\?>\s*/i', '', $outer);
+        } else {
+            $sku = trim((string)($sx->sku ?? ''));
+            $oldQty = trim((string)($sx->quantity ?? '0'));
+
+            if ($sku !== '' && isset($stany[$sku])) {
+                $qtyFeed = $stany[$sku]['qty'];
+                $gross   = $stany[$sku]['gross'];
+
+                // ZAWSZE nadpisujemy stan
+                $sx->quantity = (string)$qtyFeed;
+
+                // Cena tylko gdy stan > 0
+                if ($qtyFeed > 0) {
+                    $newPrice = round($gross * mult($gross), 2);
+                    $sx->price = number_format($newPrice, 2, '.', '');
+                }
+
+                $updated++;
+                logLine($logUpdated, "SKU={$sku} | old_qty={$oldQty} → new_qty={$qtyFeed} | cena_updated=" . ($qtyFeed > 0 ? 'TAK' : 'NIE'));
+            } else {
+                $notFound++;
+                logLine($logNotFound, $sku);
+            }
+
+            $raw = $sx->asXML();
+            $raw = preg_replace('/^<\?xml[^>]*\?>\s*/i', '', $raw);
+        }
+
+        $len = strlen($raw);
+        if ($part === 1 && $bytes + $len > MAX_PART_BYTES) {
+            writerClose($w);
+            $part = 2;
+            $w = writerOpen(OUT_PART2);
+            $bytes = 200;
+        }
+
+        $w->writeRaw($raw . "\n");
+        $bytes += $len;
+
+        if ($total % 500 === 0) {
+            echo "Postęp: $total | updated=$updated | skipped=$skipped | notFound=$notFound | part=$part\n";
+        }
+    }
+
+    writerClose($w);
+    $r->close();
+
+    echo "\nOK\nPrzetworzono: $total\nZaktualizowano: $updated\nNie znaleziono w feedzie: $notFound\n";
+    echo "Part1: " . OUT_PART1 . "\nPart2: " . OUT_PART2 . "\n";
+}
+
+// ====================== HELPERS ======================
+function writerOpen(string $path): XMLWriter {
+    $w = new XMLWriter();
+    $w->openURI($path);
+    $w->startDocument('1.0', 'UTF-8');
+    $w->startElement('products');
+    return $w;
+}
+
+function writerClose(XMLWriter $w): void {
+    $w->endElement();
+    $w->endDocument();
+    $w->flush();
+}
+
+// ====================== RUN ======================
+try {
+    echo "1) Pobieram stany...\n";
+    $raw = fetchStanyRaw();
+    echo "2) Parsuję stany...\n";
+    $stany = parseStanyMap($raw);
+    echo "   Znaleziono rekordów: " . count($stany) . "\n";
+
+    echo "3) Aktualizuję dawika.xml...\n";
+    updateProductsXmlSplit2($stany);
+
+} catch (Throwable $e) {
+    echo "BŁĄD: " . $e->getMessage() . "\n";
+}
